@@ -212,4 +212,43 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         stamp.writeText(id)
     }
     private val BuildConfig_VERSION = "1"
+
+    /** Passive diagnostics; does not execute native code or change syscall policy. */
+    fun diagnosticReport(exitSummary: String = ""): String {
+        fun status(f: File): String = "${f.absolutePath}: exists=${f.exists()}, readable=${f.canRead()}, executable=${f.canExecute()}, size=${if (f.exists()) f.length() else 0}"
+        fun elf(f: File): String = try {
+            val b = f.inputStream().use { it.readNBytes(20) }
+            if (b.size < 20 || b[0] != 0x7f.toByte() || b[1] != 'E'.code.toByte() || b[2] != 'L'.code.toByte() || b[3] != 'F'.code.toByte()) "ELF header: invalid/short"
+            else "ELF class=${b[4].toInt() and 255}, endian=${b[5].toInt() and 255}, machine=${(b[18].toInt() and 255) or ((b[19].toInt() and 255) shl 8)} (183=ARM64)"
+        } catch (t: Throwable) { "ELF inspection failed: $t" }
+        val loader = File(home, "lib/ld-linux-aarch64.so.1")
+        val binary = File(home, "bin/bricktracker")
+        val shim = File(home, "lib/libSDL2-2.0.so.0")
+        val assets = listOf("runtime.zip", "runtime.id").joinToString("\\n") { name ->
+            try { ctx.assets.open(name).use { "asset $name: readable" } }
+            catch (t: Throwable) { "asset $name: ERROR $t" }
+        }
+        val devices = InputDevice.getDeviceIds().joinToString("\\n") { id ->
+            InputDevice.getDevice(id)?.let { "input id=$id name=${it.name} sources=0x${it.sources.toString(16)}" } ?: "input id=$id unavailable"
+        }
+        return buildString {
+            appendLine("OZMA Android diagnostic report")
+            appendLine("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
+            appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            appendLine("ABIs: ${android.os.Build.SUPPORTED_ABIS.joinToString()}")
+            appendLine("Target SDK: 28 | app version: 0.1")
+            appendLine("Data directory: ${dataDir.absolutePath}")
+            appendLine("Runtime directory: ${home.absolutePath}")
+            appendLine(assets)
+            appendLine(status(loader)); appendLine(elf(loader))
+            appendLine(status(binary)); appendLine(elf(binary))
+            appendLine(status(shim)); appendLine(elf(shim))
+            appendLine("Extraction stamp: ${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}")
+            appendLine("Input devices:"); appendLine(devices)
+            appendLine("Exit summary:"); appendLine(exitSummary)
+            appendLine("Recent log:"); appendLine(tailLog(80))
+            appendLine("Specific seccomp syscall identification requires separate tracing; this report is passive.")
+        }
+    }
+
 }
