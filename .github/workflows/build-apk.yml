@@ -35,6 +35,31 @@ jobs:
       - name: Build runtime.zip (OZMA + libs)
         run: PREBUILT_LIBS="$PWD/build/libs" bash tools/build_assets.sh "$OZMA_ZIP"
 
+      - name: Install ARM64 ELF inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+
+      - name: Inspect packaged ARM64 ELF files
+        run: |
+          set -euo pipefail
+          mkdir -p build/elf
+          unzip -p app/src/main/assets/runtime.zip bin/bricktracker > build/elf/bricktracker
+          for f in libSDL2-2.0.so.0 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
+            cp "build/libs/$f" "build/elf/$f"
+          done
+          {
+            for f in build/elf/*; do
+              echo "===== $f ====="
+              header="$(aarch64-linux-gnu-readelf -h "$f")"
+              echo "$header" | grep -E 'Class:|Data:|Machine:'
+              echo "$header" | grep -q 'Class:.*ELF64'
+              echo "$header" | grep -q 'Machine:.*AArch64'
+              aarch64-linux-gnu-readelf -l "$f" | grep 'Requesting program interpreter' || true
+              aarch64-linux-gnu-readelf -d "$f" | grep 'NEEDED' || true
+            done
+          } | tee build/ozma-elf-report.txt
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
@@ -45,5 +70,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ozma-android-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            build/ozma-elf-report.txt
           retention-days: 14

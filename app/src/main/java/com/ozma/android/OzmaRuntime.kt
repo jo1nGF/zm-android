@@ -127,7 +127,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         env["HOME"] = dataDir.path; env["BT_APP_DIR"] = home.path; env["BT_DATA"] = dataDir.path
         env["TMPDIR"] = ctx.cacheDir.path
         // what platform/detect.sh exports for the 'safe' profile (no sysfs, no codec, no USB gadget, ...)
-        mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
+        mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_AS_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
             "BT_STUDIO" to "0", "BT_STUDIO_CLOCKS" to "0", "BT_USB_HOSTFIX" to "0", "BT_USB_AVAIL" to "0",
             "BT_SPEAKER_CTL" to "0", "BT_MIC_MIXER" to "0", "BT_PAUSE_SERVICES" to "", "BT_IDLE_INHIBIT" to "none",
             "BT_POWER_KEY" to "os", "BT_UPDATE" to "notify", "BT_REPORT" to "0").forEach { (k, v) -> env[k] = v }
