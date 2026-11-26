@@ -13,13 +13,16 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.content.Intent
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var rt: OzmaRuntime
     private lateinit var pad: PadView
     private lateinit var msg: TextView
     private lateinit var restart: Button
+    private lateinit var diagnostics: Button
     private var started = false
+    private var lastExit = ""
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -29,9 +32,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val sv = SurfaceView(this).also { it.holder.addCallback(this) }
         pad = PadView(this, rt)
         msg = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; setPadding(40, 40, 40, 40); visibility = View.GONE; setBackgroundColor(0xDD000000.toInt()) }
-        restart = Button(this).apply { text = "Reiniciar OZMA"; visibility = View.GONE; setOnClickListener { msg.visibility = View.GONE; visibility = View.GONE; pad.visibleControls = true; rt.start() } }
+        restart = Button(this).apply { text = "Reiniciar OZMA"; visibility = View.GONE; setOnClickListener { msg.visibility = View.GONE; visibility = View.GONE; diagnostics.visibility = View.GONE; pad.visibleControls = true; rt.start() } }
+        diagnostics = Button(this).apply { text = "Relatório / compartilhar"; visibility = View.GONE; setOnClickListener { shareReport() } }
         root.addView(sv); root.addView(pad); root.addView(msg)
         root.addView(restart, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL))
+        root.addView(diagnostics, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM or android.view.Gravity.END))
         setContentView(root)
         hideBars()
     }
@@ -45,18 +50,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onWindowFocusChanged(f: Boolean) { super.onWindowFocusChanged(f); if (f) hideBars() }
 
     private fun showExit(rc: Int, log: String) {
+        lastExit = "Código de saída: $rc\n\n$log"
         pad.visibleControls = false; pad.invalidate()
-        msg.text = "OZMA terminou (código $rc)\n\n$log\n\nLog completo: ${rt.logFile.path}"
-        msg.visibility = View.VISIBLE; restart.visibility = View.VISIBLE
+        msg.text = "OZMA terminou (código $rc)\n\n$log\n\nLog: ${rt.logFile.path}"
+        msg.visibility = View.VISIBLE; restart.visibility = View.VISIBLE; diagnostics.visibility = View.VISIBLE
     }
 
-    // ---- surface lifecycle: start the process once we have somewhere to draw
+    private fun shareReport() {
+        val report = rt.diagnosticReport(lastExit)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"; putExtra(Intent.EXTRA_SUBJECT, "Diagnóstico OZMA Android"); putExtra(Intent.EXTRA_TEXT, report)
+        }
+        startActivity(Intent.createChooser(intent, "Compartilhar diagnóstico"))
+    }
+
     override fun surfaceCreated(h: SurfaceHolder) { rt.attachSurface(h); if (!started) { started = true; rt.start() } }
     override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
     override fun surfaceDestroyed(h: SurfaceHolder) { rt.attachSurface(null) }
     override fun onDestroy() { super.onDestroy(); if (isFinishing) rt.stop() }
 
-    // ---- physical gamepad / keyboard
     private fun map(k: Int): Int = when (k) {
         KeyEvent.KEYCODE_BUTTON_A -> OzmaRuntime.BTN_A; KeyEvent.KEYCODE_BUTTON_B -> OzmaRuntime.BTN_B
         KeyEvent.KEYCODE_BUTTON_X -> OzmaRuntime.BTN_X; KeyEvent.KEYCODE_BUTTON_Y -> OzmaRuntime.BTN_Y
