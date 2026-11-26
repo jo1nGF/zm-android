@@ -52,6 +52,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     @Volatile private var lastPid: Long? = null
     @Volatile private var logcatExcerpt = ""
     private val ldDebugBase = File(ctx.filesDir, "ozma-ld-debug")
+    private data class ProbeResult(val name: String, val exitCode: Int, val timedOut: Boolean, val output: String)
 
     private fun trace(stage: String, detail: String = "", phase: Boolean = false) {
         lastTraceEvent = stage
@@ -108,6 +109,27 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val binary = File(home, "bin/bricktracker")
         val shim = File(home, "lib/libSDL2-2.0.so.0")
         trace("EXTRACTION_READY", "loader=${loader.exists()}/${loader.length()} executable=${loader.canExecute()}; binary=${binary.exists()}/${binary.length()} executable=${binary.canExecute()}; shim=${shim.exists()}/${shim.length()} executable=${shim.canExecute()}; stamp=${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}", phase = true)
+
+        // Run small, ordinary glibc programs under the same inherited Android seccomp filter
+        // before attempting the unmodified application. Stop at the first failing layer.
+        val loaderPath = File(home, "lib/ld-linux-aarch64.so.1").path
+        val libDir = File(home, "lib")
+        val probes = listOf(
+            "glibc-basic" to File(home, "diagnostics/glibc-basic"),
+            "glibc-pthread" to File(home, "diagnostics/glibc-pthread"),
+            "glibc-sdl-dlopen" to File(home, "diagnostics/glibc-sdl-dlopen")
+        )
+        for ((name, probeFile) in probes) {
+            val result = runGlibcProbe(name, probeFile, loaderPath, libDir)
+            if (result.exitCode != 0) {
+                lastExitCode = result.exitCode
+                trace("GLIBC_PREFLIGHT_FAILED", "probe=$name exitCode=${result.exitCode} timedOut=${result.timedOut}", phase = true)
+                onExit(result.exitCode, "Preflight probe failed: $name (exit=${result.exitCode}, timeout=${result.timedOut})\\n${result.output}\\nTrace: ${tailFile(traceFile, 120)}")
+                return
+            }
+        }
+        trace("GLIBC_PREFLIGHT_PASSED", "basic startup, pthread and SDL dynamic load succeeded", phase = true)
+
         ipc.deleteRecursively(); ipc.mkdirs(); dataDir.mkdirs()
         trace("IPC_DIRECTORY_READY", "ipc=${ipc.absolutePath} data=${dataDir.absolutePath}", phase = true)
         // shared frames file
@@ -123,7 +145,6 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
 
         val lib = File(home, "lib")
         val bin = File(home, "bin/bricktracker")
-        val loaderPath = File(lib, "ld-linux-aarch64.so.1").path
         val command = listOf(loaderPath, "--library-path", lib.path, bin.path, "--fullscreen")
         val pidFile = File(ipc, "bricktracker.pid")
         pidFile.delete()
@@ -186,6 +207,52 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
                 if (!stopping) onExit(-1, "wait failed: $t\nTrace: ${tailFile(traceFile, 100)}")
             }
         }, "ozma-wait").start()
+    }
+
+    private fun runGlibcProbe(name: String, binary: File, loaderPath: String, libDir: File): ProbeResult {
+        if (!binary.isFile || !binary.canExecute()) {
+            val message = "probe binary missing or not executable: ${binary.absolutePath}"
+            trace("GLIBC_PROBE_MISSING", "name=$name path=${binary.absolutePath}")
+            return ProbeResult(name, 126, false, message)
+        }
+        val outputFile = File(ctx.filesDir, "ozma-probe-$name.log")
+        val debugPrefix = File(ctx.filesDir, "ozma-probe-$name-ld")
+        outputFile.delete()
+        ctx.filesDir.listFiles()?.filter { it.name.startsWith(debugPrefix.name + ".") }?.forEach { it.delete() }
+        val command = listOf(loaderPath, "--library-path", libDir.absolutePath, binary.absolutePath)
+        val pb = ProcessBuilder(command)
+        pb.directory(dataDir)
+        val env = pb.environment()
+        env.remove("LD_LIBRARY_PATH")
+        env.remove("LD_PRELOAD")
+        env["LD_DEBUG"] = "libs,versions"
+        env["LD_DEBUG_OUTPUT"] = debugPrefix.absolutePath
+        pb.redirectErrorStream(true)
+        pb.redirectOutput(outputFile)
+        trace("GLIBC_PROBE_BEGIN", "name=$name command=${command.joinToString(" ")} output=${outputFile.absolutePath}")
+        return try {
+            val child = pb.start()
+            val finished = child.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) {
+                child.destroyForcibly()
+                child.waitFor()
+            }
+            val rc = if (finished) child.exitValue() else 124
+            val output = buildString {
+                append(tailFile(outputFile, 40))
+                val debug = ctx.filesDir.listFiles()?.filter { it.name.startsWith(debugPrefix.name + ".") }?.maxByOrNull { it.lastModified() }
+                if (debug != null) {
+                    append("\\nLD_DEBUG (${debug.name}, ${debug.length()} bytes):\\n")
+                    append(tailFile(debug, 100))
+                }
+            }
+            trace("GLIBC_PROBE_EXIT", "name=$name exitCode=$rc timedOut=${!finished} stdoutBytes=${if (outputFile.exists()) outputFile.length() else 0}")
+            ProbeResult(name, rc, !finished, output)
+        } catch (t: Throwable) {
+            val message = "${t.javaClass.simpleName}: ${t.message}"
+            trace("GLIBC_PROBE_LAUNCH_FAILED", "name=$name error=$message")
+            ProbeResult(name, 125, false, message)
+        }
     }
 
     private fun readPidFile(file: File): Long? {
@@ -375,7 +442,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         stamp.writeText(id)
         trace("EXTRACTION_STAMP_WRITTEN", "stamp=$id runtimeFiles=${home.walkTopDown().count { it.isFile }}")
     }
-    private val BuildConfig_VERSION = "1"
+    private val BuildConfig_VERSION = "2"
 
     private fun readLdDebugLog(): String {
         val files = ctx.filesDir.listFiles()?.filter { it.name.startsWith("ozma-ld-debug.") } ?: emptyList()
@@ -449,6 +516,17 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine("Exit summary:"); appendLine(exitSummary)
             appendLine("Native stdout/stderr log (${logFile.absolutePath}):"); appendLine(tailLog(80))
             appendLine("Crash/logcat excerpt:"); appendLine(logcatExcerpt)
+            appendLine("glibc preflight probes:")
+            for (name in listOf("glibc-basic", "glibc-pthread", "glibc-sdl-dlopen")) {
+                val probe = File(ctx.filesDir, "ozma-probe-$name.log")
+                appendLine("$name: exists=${probe.exists()} bytes=${if (probe.exists()) probe.length() else 0}")
+                appendLine(tailFile(probe, 40))
+                val debug = ctx.filesDir.listFiles()?.filter { it.name.startsWith("ozma-probe-$name-ld.") }?.maxByOrNull { it.lastModified() }
+                if (debug != null) {
+                    appendLine("LD_DEBUG ${debug.name}:")
+                    appendLine(tailFile(debug, 100))
+                }
+            }
             appendLine("glibc loader diagnostics (LD_DEBUG):"); appendLine(readLdDebugLog())
             appendLine("Note: app-level logcat visibility is limited by Android; absence of entries does not rule out a native signal or seccomp event.")
         }

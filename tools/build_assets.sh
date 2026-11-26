@@ -37,6 +37,16 @@ for f in libSDL2-2.0.so.0 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.s
 done
 [ -n "${DATA:-}" ] && cp -r "$DATA"/. "$R/data/"
 
+# Optional prebuilt ARM64 probes used to isolate loader/libpthread/SDL startup.
+if [ -n "${PREBUILT_PROBES:-}" ]; then
+  mkdir -p "$R/diagnostics"
+  for f in glibc-basic glibc-pthread glibc-sdl-dlopen; do
+    [ -s "$PREBUILT_PROBES/$f" ] || { echo "missing diagnostic probe: $PREBUILT_PROBES/$f"; exit 1; }
+    cp "$PREBUILT_PROBES/$f" "$R/diagnostics/$f"
+    chmod 755 "$R/diagnostics/$f"
+  done
+fi
+
 mkdir -p "$ROOT/app/src/main/assets" "$ROOT/app/src/main/res/drawable-nodpi"
 rm -f "$ROOT/app/src/main/assets/runtime.zip"
 ( cd "$R" && zip -qr -9 "$ROOT/app/src/main/assets/runtime.zip" . )

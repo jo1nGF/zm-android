@@ -19,7 +19,7 @@ jobs:
       # Only compiles the shim and copies the glibc files; zip/unzip are not needed in here.
       - name: Build aarch64 shim + glibc in Debian bullseye
         run: |
-          mkdir -p build/libs
+          mkdir -p build/libs build/probes
           docker run --rm -v "$PWD":/w debian:bullseye bash -euxc '
             apt-get update
             apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
@@ -28,12 +28,15 @@ jobs:
             for f in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
               cp -L /usr/aarch64-linux-gnu/lib/$f /w/build/libs/$f
             done
+            aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o /w/build/probes/glibc-basic /w/tools/glibc_probe.c
+            aarch64-linux-gnu-gcc -O2 -Wall -Wextra -DOZMA_PROBE_PTHREAD -pthread -o /w/build/probes/glibc-pthread /w/tools/glibc_probe.c
+            aarch64-linux-gnu-gcc -O2 -Wall -Wextra -DOZMA_PROBE_SDL -o /w/build/probes/glibc-sdl-dlopen /w/tools/glibc_probe.c -ldl
             chmod -R a+rwX /w/build
           '
-          ls -l build/libs
+          ls -l build/libs build/probes
 
-      - name: Build runtime.zip (OZMA + libs)
-        run: PREBUILT_LIBS="$PWD/build/libs" bash tools/build_assets.sh "$OZMA_ZIP"
+      - name: Build runtime.zip (OZMA + libs + probes)
+        run: PREBUILT_LIBS="$PWD/build/libs" PREBUILT_PROBES="$PWD/build/probes" bash tools/build_assets.sh "$OZMA_ZIP"
 
       - name: Install ARM64 ELF inspection tools
         run: |
@@ -47,6 +50,9 @@ jobs:
           unzip -p app/src/main/assets/runtime.zip bin/bricktracker > build/elf/bricktracker
           for f in libSDL2-2.0.so.0 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
             cp "build/libs/$f" "build/elf/$f"
+          done
+          for f in glibc-basic glibc-pthread glibc-sdl-dlopen; do
+            unzip -p app/src/main/assets/runtime.zip "diagnostics/$f" > "build/elf/$f"
           done
           {
             for f in build/elf/*; do
