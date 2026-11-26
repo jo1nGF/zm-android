@@ -4,41 +4,44 @@ on:
   workflow_dispatch:
 
 jobs:
-  runtime:
-    # Debian bullseye = glibc 2.31 (before clone3), which is the safe choice for Android 12's seccomp filter.
+  apk:
     runs-on: ubuntu-24.04
-    container: debian:bullseye
     steps:
       - uses: actions/checkout@v4
-      - name: Tools
-        run: apt-get update && apt-get install -y gcc-aarch64-linux-gnu zip unzip file
-      - name: Build runtime.zip (shim + glibc + OZMA)
+
+      - name: Find the OZMA zip you committed
         run: |
           ZIP="$(ls ozma/*.zip 2>/dev/null | head -1)"
           [ -n "$ZIP" ] || { echo "::error::Put OZMA-0_9_5-ports.zip inside the ozma/ folder of the repo"; exit 1; }
-          bash tools/build_assets.sh "$ZIP"
-          file app/src/main/assets/runtime.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: runtime-assets
-          path: app/src/main/assets
-          retention-days: 3
+          echo "OZMA_ZIP=$ZIP" >> "$GITHUB_ENV"
 
-  apk:
-    needs: runtime
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: runtime-assets
-          path: app/src/main/assets
+      # Debian bullseye = glibc 2.31 (before clone3): safest for Android 12's seccomp filter.
+      # Only compiles the shim and copies the glibc files; zip/unzip are not needed in here.
+      - name: Build aarch64 shim + glibc in Debian bullseye
+        run: |
+          mkdir -p build/libs
+          docker run --rm -v "$PWD":/w debian:bullseye bash -euxc '
+            apt-get update
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+            aarch64-linux-gnu-gcc -shared -fPIC -O2 -fvisibility=hidden -Wl,-soname,libSDL2-2.0.so.0 \
+              -o /w/build/libs/libSDL2-2.0.so.0 /w/shim/sdl_shim.c -lpthread
+            for f in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
+              cp -L /usr/aarch64-linux-gnu/lib/$f /w/build/libs/$f
+            done
+            chmod -R a+rwX /w/build
+          '
+          ls -l build/libs
+
+      - name: Build runtime.zip (OZMA + libs)
+        run: PREBUILT_LIBS="$PWD/build/libs" bash tools/build_assets.sh "$OZMA_ZIP"
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.7' }
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
+
       - uses: actions/upload-artifact@v4
         with:
           name: ozma-android-apk
