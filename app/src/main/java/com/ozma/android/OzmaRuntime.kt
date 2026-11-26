@@ -119,7 +119,13 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val bin = File(home, "bin/bricktracker")
         val loaderPath = File(lib, "ld-linux-aarch64.so.1").path
         val command = listOf(loaderPath, "--library-path", lib.path, bin.path, "--fullscreen")
-        val pb = ProcessBuilder(command)
+        val pidFile = File(ipc, "bricktracker.pid")
+        pidFile.delete()
+        // Process.pid() is not exposed by Android's java.lang.Process API. A shell writes $$,
+        // then exec replaces itself with the loader so the child PID remains stable.
+        val shellLauncher = "echo \$\$ > \"\$1\"; shift; exec \"\$@\""
+        val launchCommand = listOf("/system/bin/sh", "-c", shellLauncher, "ozma-launcher", pidFile.path) + command
+        val pb = ProcessBuilder(launchCommand)
         pb.directory(dataDir)
         val env = pb.environment()
         env.remove("LD_LIBRARY_PATH"); env.remove("LD_PRELOAD")        // Android's bionic paths must not leak into glibc
@@ -135,11 +141,11 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         logFile.delete()
         pb.redirectErrorStream(true)
         pb.redirectOutput(logFile)
-        trace("PROCESS_LAUNCH_BEGIN", "cwd=${dataDir.absolutePath}; command=${command.joinToString(" ")}; OZMA_IPC=${ipc.absolutePath}; HOME=${dataDir.absolutePath}; BT_APP_DIR=${home.absolutePath}; TMPDIR=${ctx.cacheDir.absolutePath}; stdout+stderr=${logFile.absolutePath}")
+        trace("PROCESS_LAUNCH_BEGIN", "cwd=${dataDir.absolutePath}; command=${command.joinToString(" ")}; launcher=/system/bin/sh exec; pidFile=${pidFile.absolutePath}; OZMA_IPC=${ipc.absolutePath}; HOME=${dataDir.absolutePath}; BT_APP_DIR=${home.absolutePath}; TMPDIR=${ctx.cacheDir.absolutePath}; stdout+stderr=${logFile.absolutePath}")
         val p = pb.start()
         process = p
-        lastPid = p.pid()
-        trace("PROCESS_STARTED", "pid=${p.pid()} process=${p}; stdoutLog=${logFile.absolutePath}")
+        lastPid = readPidFile(pidFile)
+        trace("PROCESS_STARTED", "pid=${lastPid ?: "<unavailable>"} process=${p}; pidFile=${pidFile.absolutePath}; stdoutLog=${logFile.absolutePath}")
 
         accept(vs, "video") { videoLoop(it, shm) }
         accept(asrv, "audio") { audioLoop(it) }
@@ -150,13 +156,14 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             try {
                 val rc = p.waitFor()
                 lastExitCode = rc
-                trace("PROCESS_EXIT", "pid=${p.pid()} exitCode=$rc stdoutBytes=${if (logFile.exists()) logFile.length() else 0}; shellSignalCandidate=${if (rc in 129..192) rc - 128 else "none"} (heuristic only)")
-                logcatExcerpt = collectLogcat(p.pid())
+                val exitedPid = lastPid
+                trace("PROCESS_EXIT", "pid=${exitedPid ?: "<unavailable>"} exitCode=$rc stdoutBytes=${if (logFile.exists()) logFile.length() else 0}; shellSignalCandidate=${if (rc in 129..192) rc - 128 else "none"} (heuristic only)")
+                logcatExcerpt = exitedPid?.let { collectLogcat(it) } ?: "PID unavailable; could not correlate app-level logcat with the child process."
                 trace("LOGCAT_CAPTURE_COMPLETE", logcatExcerpt)
                 val combined = buildString {
                     append(tailLog())
                     if (isNotEmpty()) append("\n")
-                    append("Exit code: $rc; PID: ${p.pid()}\n")
+                    append("Exit code: $rc; PID: ${exitedPid ?: "<unavailable>"}\n")
                     append("Process trace: ${traceFile.absolutePath}\n")
                     append("Logcat excerpt:\n")
                     append(logcatExcerpt)
@@ -167,6 +174,18 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
                 if (!stopping) onExit(-1, "wait failed: $t\nTrace: ${tailFile(traceFile, 100)}")
             }
         }, "ozma-wait").start()
+    }
+
+    private fun readPidFile(file: File): Long? {
+        repeat(50) {
+            val pid = try { if (file.exists()) file.readText().trim().toLongOrNull() else null } catch (_: Throwable) { null }
+            if (pid != null && pid > 0) return pid
+            try { Thread.sleep(10) } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return null
     }
 
     private fun collectLogcat(pid: Long): String {
