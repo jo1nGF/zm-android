@@ -51,6 +51,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     @Volatile private var lastExitCode: Int? = null
     @Volatile private var lastPid: Long? = null
     @Volatile private var logcatExcerpt = ""
+    private val ldDebugBase = File(ctx.filesDir, "ozma-ld-debug")
 
     private fun trace(stage: String, detail: String = "", phase: Boolean = false) {
         lastTraceEvent = stage
@@ -85,6 +86,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         lastPid = null
         logcatExcerpt = ""
         connectedIpc.clear()
+        ctx.filesDir.listFiles()?.filter { it.name.startsWith("ozma-ld-debug.") }?.forEach { it.delete() }
         synchronized(traceLock) {
             try { traceFile.parentFile?.mkdirs(); traceFile.writeText("", Charsets.UTF_8) } catch (_: Throwable) { }
         }
@@ -136,6 +138,10 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         env["OZMA_IPC"] = ipc.path; env["OZMA_W"] = "1024"; env["OZMA_H"] = "768"
         env["HOME"] = dataDir.path; env["BT_APP_DIR"] = home.path; env["BT_DATA"] = dataDir.path
         env["TMPDIR"] = ctx.cacheDir.path
+        // Temporary loader diagnostics: the glibc loader appends its PID to LD_DEBUG_OUTPUT.
+        env["LD_DEBUG"] = "libs,versions"
+        env["LD_DEBUG_OUTPUT"] = ldDebugBase.absolutePath
+        trace("GLIBC_LD_DEBUG_ENABLED", "categories=libs,versions outputPrefix=${ldDebugBase.absolutePath}")
         // what platform/detect.sh exports for the 'safe' profile (no sysfs, no codec, no USB gadget, ...)
         mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_AS_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
             "BT_STUDIO" to "0", "BT_STUDIO_CLOCKS" to "0", "BT_USB_HOSTFIX" to "0", "BT_USB_AVAIL" to "0",
@@ -371,6 +377,12 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     }
     private val BuildConfig_VERSION = "1"
 
+    private fun readLdDebugLog(): String {
+        val files = ctx.filesDir.listFiles()?.filter { it.name.startsWith("ozma-ld-debug.") } ?: emptyList()
+        val latest = files.maxByOrNull { it.lastModified() } ?: return "<no LD_DEBUG file created; loader may have exited before emitting diagnostics>"
+        return "file=${latest.absolutePath} bytes=${latest.length()}\\n" + tailFile(latest, 180)
+    }
+
     private fun readSmallFile(path: String): String = try {
         File(path).readText().trim().replace('\n', ' ').take(1200)
     } catch (t: Throwable) { "<unavailable: ${t.javaClass.simpleName}: ${t.message}>" }
@@ -437,6 +449,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine("Exit summary:"); appendLine(exitSummary)
             appendLine("Native stdout/stderr log (${logFile.absolutePath}):"); appendLine(tailLog(80))
             appendLine("Crash/logcat excerpt:"); appendLine(logcatExcerpt)
+            appendLine("glibc loader diagnostics (LD_DEBUG):"); appendLine(readLdDebugLog())
             appendLine("Note: app-level logcat visibility is limited by Android; absence of entries does not rule out a native signal or seccomp event.")
         }
     }
