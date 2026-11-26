@@ -124,7 +124,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             if (result.exitCode != 0) {
                 lastExitCode = result.exitCode
                 trace("GLIBC_PREFLIGHT_FAILED", "probe=$name exitCode=${result.exitCode} timedOut=${result.timedOut}", phase = true)
-                onExit(result.exitCode, "Preflight probe failed: $name (exit=${result.exitCode}, timeout=${result.timedOut})\\n${result.output}\\nTrace: ${tailFile(traceFile, 120)}")
+                onExit(result.exitCode, "Preflight probe failed: $name (exit=${result.exitCode}, timeout=${result.timedOut})\n${result.output}\nTrace: ${tailFile(traceFile, 120)}")
                 return
             }
         }
@@ -242,7 +242,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
                 append(tailFile(outputFile, 40))
                 val debug = ctx.filesDir.listFiles()?.filter { it.name.startsWith(debugPrefix.name + ".") }?.maxByOrNull { it.lastModified() }
                 if (debug != null) {
-                    append("\\nLD_DEBUG (${debug.name}, ${debug.length()} bytes):\\n")
+                    append("\nLD_DEBUG (${debug.name}, ${debug.length()} bytes):\n")
                     append(tailFile(debug, 100))
                 }
             }
@@ -427,7 +427,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
                 out.parentFile?.mkdirs()
                 if (e.name.startsWith("data/")) continue                  // data goes to the user-visible folder below
                 out.outputStream().use { z.copyTo(it) }
-                if (e.name.startsWith("bin/") || e.name.startsWith("lib/")) out.setExecutable(true, false)
+                if (e.name.startsWith("bin/") || e.name.startsWith("lib/") || e.name.startsWith("diagnostics/")) out.setExecutable(true, false)
             }
         }
         // stock songs / samples: copy only what is missing (never overwrite the user's files)
@@ -442,7 +442,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         stamp.writeText(id)
         trace("EXTRACTION_STAMP_WRITTEN", "stamp=$id runtimeFiles=${home.walkTopDown().count { it.isFile }}")
     }
-    private val BuildConfig_VERSION = "2"
+    private val BuildConfig_VERSION = "3"
 
     private fun readLdDebugLog(): String {
         val files = ctx.filesDir.listFiles()?.filter { it.name.startsWith("ozma-ld-debug.") } ?: emptyList()
