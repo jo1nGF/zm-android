@@ -218,7 +218,16 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     fun diagnosticReport(exitSummary: String = ""): String {
         fun status(f: File): String = "${f.absolutePath}: exists=${f.exists()}, readable=${f.canRead()}, executable=${f.canExecute()}, size=${if (f.exists()) f.length() else 0}"
         fun elf(f: File): String = try {
-            val b = f.inputStream().use { it.readNBytes(20) }
+            val b = f.inputStream().use { stream ->
+                val buffer = ByteArray(20)
+                var offset = 0
+                while (offset < buffer.size) {
+                    val count = stream.read(buffer, offset, buffer.size - offset)
+                    if (count <= 0) break
+                    offset += count
+                }
+                buffer.copyOf(offset)
+            }
             if (b.size < 20 || b[0] != 0x7f.toByte() || b[1] != 'E'.code.toByte() || b[2] != 'L'.code.toByte() || b[3] != 'F'.code.toByte()) "ELF header: invalid/short"
             else "ELF class=${b[4].toInt() and 255}, endian=${b[5].toInt() and 255}, machine=${(b[18].toInt() and 255) or ((b[19].toInt() and 255) shl 8)} (183=ARM64)"
         } catch (t: Throwable) { "ELF inspection failed: $t" }
