@@ -16,6 +16,7 @@ import android.view.SurfaceHolder
 import android.view.InputDevice
 import java.io.DataInputStream
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -42,6 +43,28 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     private val ipc = File(ctx.filesDir, "ipc")
     val dataDir: File = (ctx.getExternalFilesDir(null) ?: ctx.filesDir).let { File(it, "OZMA") }
     val logFile = File(ctx.filesDir, "ozma.log")
+    val traceFile = File(ctx.filesDir, "ozma-trace.log")
+    private val traceLock = Any()
+    @Volatile private var currentStage = "idle"
+    @Volatile private var lastExitCode: Int? = null
+    @Volatile private var lastPid: Long? = null
+    @Volatile private var logcatExcerpt = ""
+
+    private fun trace(stage: String, detail: String = "") {
+        currentStage = stage
+        val safeDetail = detail.replace('\n', ' ').replace('\r', ' ')
+        val line = "${System.currentTimeMillis()} [${stage}] ${safeDetail}\n"
+        synchronized(traceLock) {
+            try {
+                traceFile.parentFile?.mkdirs()
+                traceFile.appendText(line, Charsets.UTF_8)
+            } catch (_: Throwable) { }
+        }
+    }
+
+    private fun tailFile(file: File, count: Int): String = try {
+        if (!file.exists()) "" else file.readLines().takeLast(count).joinToString("\n")
+    } catch (_: Throwable) { "" }
 
     @Volatile private var process: Process? = null
     @Volatile private var inputOut: OutputStream? = null
@@ -55,21 +78,48 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     // ---------------------------------------------------------------- start / stop
     fun start() {
         stopping = false
-        Thread({ try { startInternal() } catch (t: Throwable) { onExit(-1, "start failed: $t") } }, "ozma-start").start()
+        lastExitCode = null
+        lastPid = null
+        logcatExcerpt = ""
+        synchronized(traceLock) {
+            try { traceFile.parentFile?.mkdirs(); traceFile.writeText("", Charsets.UTF_8) } catch (_: Throwable) { }
+        }
+        trace("START_REQUEST", "runtime=${home.absolutePath} data=${dataDir.absolutePath}")
+        Thread({
+            try {
+                startInternal()
+            } catch (t: Throwable) {
+                trace("START_FAILED", android.util.Log.getStackTraceString(t))
+                onExit(-1, "start failed: $t\nTrace: ${tailFile(traceFile, 80)}")
+            }
+        }, "ozma-start").start()
     }
 
     private fun startInternal() {
+        trace("EXTRACTION_BEGIN", "runtime assets=runtime.zip/runtime.id")
         extractIfNeeded()
+        val loader = File(home, "lib/ld-linux-aarch64.so.1")
+        val binary = File(home, "bin/bricktracker")
+        val shim = File(home, "lib/libSDL2-2.0.so.0")
+        trace("EXTRACTION_READY", "loader=${loader.exists()}/${loader.length()} executable=${loader.canExecute()}; binary=${binary.exists()}/${binary.length()} executable=${binary.canExecute()}; shim=${shim.exists()}/${shim.length()} executable=${shim.canExecute()}; stamp=${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}")
         ipc.deleteRecursively(); ipc.mkdirs(); dataDir.mkdirs()
+        trace("IPC_DIRECTORY_READY", "ipc=${ipc.absolutePath} data=${dataDir.absolutePath}")
         // shared frames file
         val shmFile = File(ipc, "frames.shm")
-        val raf = RandomAccessFile(shmFile, "rw"); raf.setLength((HDR + 2L * MAX_W * MAX_H * 4)); 
+        val raf = RandomAccessFile(shmFile, "rw")
+        raf.setLength((HDR + 2L * MAX_W * MAX_H * 4))
         val shm = raf.channel.map(FileChannel.MapMode.READ_WRITE, 0, raf.length()).order(ByteOrder.LITTLE_ENDIAN)
+        trace("SHARED_MEMORY_READY", "path=${shmFile.absolutePath} bytes=${raf.length()}")
 
-        val vs = server("video.sock"); val asrv = server("audio.sock"); val isrv = server("input.sock")
+        val vs = server("video.sock")
+        val asrv = server("audio.sock")
+        val isrv = server("input.sock")
 
-        val lib = File(home, "lib"); val bin = File(home, "bin/bricktracker")
-        val pb = ProcessBuilder(File(lib, "ld-linux-aarch64.so.1").path, "--library-path", lib.path, bin.path, "--fullscreen")
+        val lib = File(home, "lib")
+        val bin = File(home, "bin/bricktracker")
+        val loaderPath = File(lib, "ld-linux-aarch64.so.1").path
+        val command = listOf(loaderPath, "--library-path", lib.path, bin.path, "--fullscreen")
+        val pb = ProcessBuilder(command)
         pb.directory(dataDir)
         val env = pb.environment()
         env.remove("LD_LIBRARY_PATH"); env.remove("LD_PRELOAD")        // Android's bionic paths must not leak into glibc
@@ -77,21 +127,79 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         env["HOME"] = dataDir.path; env["BT_APP_DIR"] = home.path; env["BT_DATA"] = dataDir.path
         env["TMPDIR"] = ctx.cacheDir.path
         // what platform/detect.sh exports for the 'safe' profile (no sysfs, no codec, no USB gadget, ...)
-        mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_AS_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
+        mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
             "BT_STUDIO" to "0", "BT_STUDIO_CLOCKS" to "0", "BT_USB_HOSTFIX" to "0", "BT_USB_AVAIL" to "0",
             "BT_SPEAKER_CTL" to "0", "BT_MIC_MIXER" to "0", "BT_PAUSE_SERVICES" to "", "BT_IDLE_INHIBIT" to "none",
             "BT_POWER_KEY" to "os", "BT_UPDATE" to "notify", "BT_REPORT" to "0").forEach { (k, v) -> env[k] = v }
-        pb.redirectErrorStream(true); pb.redirectOutput(logFile)
-        val p = pb.start(); process = p
+        logFile.parentFile?.mkdirs()
+        logFile.delete()
+        pb.redirectErrorStream(true)
+        pb.redirectOutput(logFile)
+        trace("PROCESS_LAUNCH_BEGIN", "cwd=${dataDir.absolutePath}; command=${command.joinToString(" ")}; OZMA_IPC=${ipc.absolutePath}; HOME=${dataDir.absolutePath}; BT_APP_DIR=${home.absolutePath}; TMPDIR=${ctx.cacheDir.absolutePath}; stdout+stderr=${logFile.absolutePath}")
+        val p = pb.start()
+        process = p
+        lastPid = p.pid()
+        trace("PROCESS_STARTED", "pid=${p.pid()} process=${p}; stdoutLog=${logFile.absolutePath}")
 
-        accept(vs) { videoLoop(it, shm) }
-        accept(asrv) { audioLoop(it) }
-        accept(isrv) { inputOut = it.outputStream }
+        accept(vs, "video") { videoLoop(it, shm) }
+        accept(asrv, "audio") { audioLoop(it) }
+        accept(isrv, "input") { inputOut = it.outputStream; trace("IPC_INPUT_READY", "input socket accepted") }
+        trace("IPC_ACCEPT_THREADS_STARTED", "video/audio/input acceptors launched")
 
         Thread({
-            val rc = p.waitFor()
-            if (!stopping) onExit(rc, tailLog())
+            try {
+                val rc = p.waitFor()
+                lastExitCode = rc
+                trace("PROCESS_EXIT", "pid=${p.pid()} exitCode=$rc stdoutBytes=${if (logFile.exists()) logFile.length() else 0}; shellSignalCandidate=${if (rc in 129..192) rc - 128 else "none"} (heuristic only)")
+                logcatExcerpt = collectLogcat(p.pid())
+                trace("LOGCAT_CAPTURE_COMPLETE", logcatExcerpt)
+                val combined = buildString {
+                    append(tailLog())
+                    if (isNotEmpty()) append("\n")
+                    append("Exit code: $rc; PID: ${p.pid()}\n")
+                    append("Process trace: ${traceFile.absolutePath}\n")
+                    append("Logcat excerpt:\n")
+                    append(logcatExcerpt)
+                }
+                if (!stopping) onExit(rc, combined)
+            } catch (t: Throwable) {
+                trace("WAIT_FAILED", android.util.Log.getStackTraceString(t))
+                if (!stopping) onExit(-1, "wait failed: $t\nTrace: ${tailFile(traceFile, 100)}")
+            }
         }, "ozma-wait").start()
+    }
+
+    private fun collectLogcat(pid: Long): String {
+        val dump = File(ctx.cacheDir, "ozma-logcat-dump.txt")
+        return try {
+            dump.delete()
+            val collector = ProcessBuilder("logcat", "-d", "-v", "threadtime", "-t", "500")
+                .redirectErrorStream(true)
+                .redirectOutput(dump)
+                .start()
+            if (!collector.waitFor(3, TimeUnit.SECONDS)) {
+                collector.destroyForcibly()
+                "logcat collection timed out"
+            } else if (!dump.exists()) {
+                "logcat produced no readable output"
+            } else {
+                val lines = dump.readLines()
+                val pidHeader = Regex("^\\S+\\s+\\S+\\s+${pid}\\s")
+                val anchors = Regex("(?i)(SIGSYS|seccomp|fatal signal|signal 31|debuggerd|tombstoned|avc: denied|pid:\\s*${pid}\\b)")
+                val hits = lines.indices.filter { i ->
+                    pidHeader.containsMatchIn(lines[i]) || anchors.containsMatchIn(lines[i])
+                }
+                val selected = hits.flatMap { i -> (maxOf(0, i - 2)..minOf(lines.lastIndex, i + 3)) }
+                    .distinct().sorted().takeLast(80)
+                if (selected.isEmpty()) {
+                    "No matching process/crash lines visible through app-level logcat. Android may restrict system crash records."
+                } else selected.joinToString("\n") { lines[it] }
+            }
+        } catch (t: Throwable) {
+            "logcat unavailable: $t"
+        } finally {
+            dump.delete()
+        }
     }
 
     fun stop() {
@@ -122,16 +230,31 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
 
     // ---------------------------------------------------------------- ipc helpers
     private fun server(name: String): LocalServerSocket {
-        val path = File(ipc, name); path.delete()
-        val ls = LocalSocket(); ls.bind(LocalSocketAddress(path.path, LocalSocketAddress.Namespace.FILESYSTEM))
-        val s = LocalServerSocket(ls.fileDescriptor); servers += s; return s
+        val path = File(ipc, name)
+        path.delete()
+        val ls = LocalSocket()
+        ls.bind(LocalSocketAddress(path.path, LocalSocketAddress.Namespace.FILESYSTEM))
+        val s = LocalServerSocket(ls.fileDescriptor)
+        servers += s
+        trace("IPC_SOCKET_BOUND", "name=$name path=${path.absolutePath}")
+        return s
     }
-    private fun accept(s: LocalServerSocket, body: (LocalSocket) -> Unit) {
-        Thread({ try { body(s.accept()) } catch (_: Throwable) {} }, "ozma-ipc").start()
+    private fun accept(s: LocalServerSocket, name: String, body: (LocalSocket) -> Unit) {
+        Thread({
+            trace("IPC_ACCEPT_WAIT", "name=$name")
+            try {
+                val socket = s.accept()
+                trace("IPC_CONNECTED", "name=$name")
+                body(socket)
+            } catch (t: Throwable) {
+                trace("IPC_ACCEPT_OR_HANDLER_FAILED", "name=$name error=$t")
+            }
+        }, "ozma-ipc-$name").start()
     }
 
     // ---------------------------------------------------------------- video
     private fun videoLoop(sock: LocalSocket, shm: ByteBuffer) {
+        trace("VIDEO_PIPE_ACTIVE", "video socket connected")
         val inp = sock.inputStream; val paint = Paint().apply { isFilterBitmap = false }
         var bmp: Bitmap? = null; val buf = ByteArray(64)
         while (true) {
@@ -158,6 +281,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
 
     // ---------------------------------------------------------------- audio
     private fun audioLoop(sock: LocalSocket) {
+        trace("AUDIO_PIPE_ACTIVE", "audio socket connected")
         AndroidProcess.setThreadPriority(AndroidProcess.THREAD_PRIORITY_URGENT_AUDIO)
         val inp = DataInputStream(sock.inputStream)
         val hb = ByteArray(16); inp.readFully(hb)
@@ -168,12 +292,15 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val mask = if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
         val enc = if (isFloat) AudioFormat.ENCODING_PCM_FLOAT else AudioFormat.ENCODING_PCM_16BIT
         val min = AudioTrack.getMinBufferSize(freq, mask, enc)
+        trace("AUDIO_FORMAT_RECEIVED", "freq=$freq format=0x${fmt.toString(16)} channels=$ch samples=$samples minBuffer=$min")
         val track = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioFormat(AudioFormat.Builder().setEncoding(enc).setSampleRate(freq).setChannelMask(mask).build())
             .setBufferSizeInBytes(maxOf(min, chunk * 2))
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY).build()
+        trace("AUDIO_TRACK_CREATED", "state=${track.state} sampleRate=${track.sampleRate} buffer=${track.bufferSizeInFrames}")
         track.play()
+        trace("AUDIO_TRACK_PLAYING", "playState=${track.playState}")
         val raw = ByteArray(chunk); val fl = FloatArray(samples * ch)
         try {
             while (true) {
@@ -188,7 +315,10 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     private fun extractIfNeeded() {
         val id = ctx.assets.open("runtime.id").bufferedReader().readText().trim() + "-" + BuildConfig_VERSION
         val stamp = File(home, ".id")
-        if (stamp.exists() && stamp.readText() == id && File(home, "bin/bricktracker").exists()) return
+        if (stamp.exists() && stamp.readText() == id && File(home, "bin/bricktracker").exists()) {
+            trace("EXTRACTION_SKIPPED", "matching stamp=$id")
+            return
+        }
         home.deleteRecursively(); home.mkdirs()
         ZipInputStream(ctx.assets.open("runtime.zip")).use { z ->
             while (true) {
@@ -211,6 +341,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             }
         }
         stamp.writeText(id)
+        trace("EXTRACTION_STAMP_WRITTEN", "stamp=$id runtimeFiles=${home.walkTopDown().count { it.isFile }}")
     }
     private val BuildConfig_VERSION = "1"
 
@@ -239,7 +370,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             catch (t: Throwable) { "asset $name: ERROR $t" }
         }
         val devices = InputDevice.getDeviceIds().joinToString("\\n") { id ->
-            InputDevice.getDevice(id)?.let { "input id=$id name=${it.name} sources=0x${it.sources.toString(16)}" } ?: "input id=$id unavailable"
+            InputDevice.getDevice(id)?.let { "input id=$id name=${it.name} sources=0x${Integer.toUnsignedString(it.sources, 16)}" } ?: "input id=$id unavailable"
         }
         return buildString {
             appendLine("OZMA Android diagnostic report")
@@ -255,9 +386,13 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine(status(shim)); appendLine(elf(shim))
             appendLine("Extraction stamp: ${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}")
             appendLine("Input devices:"); appendLine(devices)
+            appendLine("Run state: stage=$currentStage pid=${lastPid ?: "<not started>"} exitCode=${lastExitCode ?: "<running/unknown>"}")
+            appendLine("Trace file: ${traceFile.absolutePath}")
+            appendLine("Recent execution trace:"); appendLine(tailFile(traceFile, 120))
             appendLine("Exit summary:"); appendLine(exitSummary)
-            appendLine("Recent log:"); appendLine(tailLog(80))
-            appendLine("Specific seccomp syscall identification requires separate tracing; this report is passive.")
+            appendLine("Native stdout/stderr log (${logFile.absolutePath}):"); appendLine(tailLog(80))
+            appendLine("Crash/logcat excerpt:"); appendLine(logcatExcerpt)
+            appendLine("Note: app-level logcat visibility is limited by Android; absence of entries does not rule out a native signal or seccomp event.")
         }
     }
 
