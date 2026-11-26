@@ -1,7 +1,14 @@
 #include <unistd.h>
 #include <stddef.h>
 
-#if defined(OZMA_PROBE_PTHREAD)
+#if defined(OZMA_PROBE_PTHREAD_LINK_ONLY)
+#include <pthread.h>
+int main(void) {
+    static const char message[] = "OZMA_PTHREAD_LINK_ONLY_MAIN_OK\\n";
+    (void)write(STDOUT_FILENO, message, sizeof(message) - 1);
+    return 0;
+}
+#elif defined(OZMA_PROBE_PTHREAD)
 #include <pthread.h>
 static void *probe_worker(void *unused) {
     (void)unused;

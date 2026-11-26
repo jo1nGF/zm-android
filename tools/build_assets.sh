@@ -40,7 +40,7 @@ done
 # Optional prebuilt ARM64 probes used to isolate loader/libpthread/SDL startup.
 if [ -n "${PREBUILT_PROBES:-}" ]; then
   mkdir -p "$R/diagnostics"
-  for f in glibc-basic glibc-pthread glibc-sdl-dlopen; do
+  for f in glibc-basic glibc-pthread-link-only glibc-pthread glibc-sdl-dlopen; do
     [ -s "$PREBUILT_PROBES/$f" ] || { echo "missing diagnostic probe: $PREBUILT_PROBES/$f"; exit 1; }
     cp "$PREBUILT_PROBES/$f" "$R/diagnostics/$f"
     chmod 755 "$R/diagnostics/$f"

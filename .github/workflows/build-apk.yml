@@ -51,7 +51,7 @@ jobs:
           for f in libSDL2-2.0.so.0 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
             cp "build/libs/$f" "build/elf/$f"
           done
-          for f in glibc-basic glibc-pthread glibc-sdl-dlopen; do
+          for f in glibc-basic glibc-pthread-link-only glibc-pthread glibc-sdl-dlopen; do
             unzip -p app/src/main/assets/runtime.zip "diagnostics/$f" > "build/elf/$f"
           done
           {

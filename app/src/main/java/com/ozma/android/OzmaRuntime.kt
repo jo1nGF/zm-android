@@ -115,7 +115,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val loaderPath = File(home, "lib/ld-linux-aarch64.so.1").path
         val libDir = File(home, "lib")
         val probes = listOf(
-            "glibc-basic" to File(home, "diagnostics/glibc-basic"),
+            "glibc-basic" to File(home, "diagnostics/glibc-basic"),\n            "glibc-pthread-link-only" to File(home, "diagnostics/glibc-pthread-link-only"),
             "glibc-pthread" to File(home, "diagnostics/glibc-pthread"),
             "glibc-sdl-dlopen" to File(home, "diagnostics/glibc-sdl-dlopen")
         )
@@ -517,7 +517,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine("Native stdout/stderr log (${logFile.absolutePath}):"); appendLine(tailLog(80))
             appendLine("Crash/logcat excerpt:"); appendLine(logcatExcerpt)
             appendLine("glibc preflight probes:")
-            for (name in listOf("glibc-basic", "glibc-pthread", "glibc-sdl-dlopen")) {
+            for (name in listOf("glibc-basic", "glibc-pthread-link-only", "glibc-pthread", "glibc-sdl-dlopen")) {
                 val probe = File(ctx.filesDir, "ozma-probe-$name.log")
                 appendLine("$name: exists=${probe.exists()} bytes=${if (probe.exists()) probe.length() else 0}")
                 appendLine(tailFile(probe, 40))
