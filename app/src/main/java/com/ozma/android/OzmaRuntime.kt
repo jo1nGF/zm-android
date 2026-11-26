@@ -46,12 +46,15 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     val traceFile = File(ctx.filesDir, "ozma-trace.log")
     private val traceLock = Any()
     @Volatile private var currentStage = "idle"
+    @Volatile private var lastTraceEvent = "idle"
+    private val connectedIpc = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     @Volatile private var lastExitCode: Int? = null
     @Volatile private var lastPid: Long? = null
     @Volatile private var logcatExcerpt = ""
 
-    private fun trace(stage: String, detail: String = "") {
-        currentStage = stage
+    private fun trace(stage: String, detail: String = "", phase: Boolean = false) {
+        lastTraceEvent = stage
+        if (phase) currentStage = stage
         val safeDetail = detail.replace('\n', ' ').replace('\r', ' ')
         val line = "${System.currentTimeMillis()} [${stage}] ${safeDetail}\n"
         synchronized(traceLock) {
@@ -81,35 +84,36 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         lastExitCode = null
         lastPid = null
         logcatExcerpt = ""
+        connectedIpc.clear()
         synchronized(traceLock) {
             try { traceFile.parentFile?.mkdirs(); traceFile.writeText("", Charsets.UTF_8) } catch (_: Throwable) { }
         }
-        trace("START_REQUEST", "runtime=${home.absolutePath} data=${dataDir.absolutePath}")
+        trace("START_REQUEST", "runtime=${home.absolutePath} data=${dataDir.absolutePath}", phase = true)
         Thread({
             try {
                 startInternal()
             } catch (t: Throwable) {
-                trace("START_FAILED", android.util.Log.getStackTraceString(t))
+                trace("START_FAILED", android.util.Log.getStackTraceString(t), phase = true)
                 onExit(-1, "start failed: $t\nTrace: ${tailFile(traceFile, 80)}")
             }
         }, "ozma-start").start()
     }
 
     private fun startInternal() {
-        trace("EXTRACTION_BEGIN", "runtime assets=runtime.zip/runtime.id")
+        trace("EXTRACTION_BEGIN", "runtime assets=runtime.zip/runtime.id", phase = true)
         extractIfNeeded()
         val loader = File(home, "lib/ld-linux-aarch64.so.1")
         val binary = File(home, "bin/bricktracker")
         val shim = File(home, "lib/libSDL2-2.0.so.0")
-        trace("EXTRACTION_READY", "loader=${loader.exists()}/${loader.length()} executable=${loader.canExecute()}; binary=${binary.exists()}/${binary.length()} executable=${binary.canExecute()}; shim=${shim.exists()}/${shim.length()} executable=${shim.canExecute()}; stamp=${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}")
+        trace("EXTRACTION_READY", "loader=${loader.exists()}/${loader.length()} executable=${loader.canExecute()}; binary=${binary.exists()}/${binary.length()} executable=${binary.canExecute()}; shim=${shim.exists()}/${shim.length()} executable=${shim.canExecute()}; stamp=${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}", phase = true)
         ipc.deleteRecursively(); ipc.mkdirs(); dataDir.mkdirs()
-        trace("IPC_DIRECTORY_READY", "ipc=${ipc.absolutePath} data=${dataDir.absolutePath}")
+        trace("IPC_DIRECTORY_READY", "ipc=${ipc.absolutePath} data=${dataDir.absolutePath}", phase = true)
         // shared frames file
         val shmFile = File(ipc, "frames.shm")
         val raf = RandomAccessFile(shmFile, "rw")
         raf.setLength((HDR + 2L * MAX_W * MAX_H * 4))
         val shm = raf.channel.map(FileChannel.MapMode.READ_WRITE, 0, raf.length()).order(ByteOrder.LITTLE_ENDIAN)
-        trace("SHARED_MEMORY_READY", "path=${shmFile.absolutePath} bytes=${raf.length()}")
+        trace("SHARED_MEMORY_READY", "path=${shmFile.absolutePath} bytes=${raf.length()}", phase = true)
 
         val vs = server("video.sock")
         val asrv = server("audio.sock")
@@ -141,11 +145,11 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         logFile.delete()
         pb.redirectErrorStream(true)
         pb.redirectOutput(logFile)
-        trace("PROCESS_LAUNCH_BEGIN", "cwd=${dataDir.absolutePath}; command=${command.joinToString(" ")}; launcher=/system/bin/sh exec; pidFile=${pidFile.absolutePath}; OZMA_IPC=${ipc.absolutePath}; HOME=${dataDir.absolutePath}; BT_APP_DIR=${home.absolutePath}; TMPDIR=${ctx.cacheDir.absolutePath}; stdout+stderr=${logFile.absolutePath}")
+        trace("PROCESS_LAUNCH_BEGIN", "cwd=${dataDir.absolutePath}; command=${command.joinToString(" ")}; launcher=/system/bin/sh exec; pidFile=${pidFile.absolutePath}; OZMA_IPC=${ipc.absolutePath}; HOME=${dataDir.absolutePath}; BT_APP_DIR=${home.absolutePath}; TMPDIR=${ctx.cacheDir.absolutePath}; stdout+stderr=${logFile.absolutePath}", phase = true)
         val p = pb.start()
         process = p
         lastPid = readPidFile(pidFile)
-        trace("PROCESS_STARTED", "pid=${lastPid ?: "<unavailable>"} process=${p}; pidFile=${pidFile.absolutePath}; stdoutLog=${logFile.absolutePath}")
+        trace("PROCESS_STARTED", "pid=${lastPid ?: "<unavailable>"} process=${p}; pidFile=${pidFile.absolutePath}; stdoutLog=${logFile.absolutePath}", phase = true)
 
         accept(vs, "video") { videoLoop(it, shm) }
         accept(asrv, "audio") { audioLoop(it) }
@@ -157,7 +161,9 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
                 val rc = p.waitFor()
                 lastExitCode = rc
                 val exitedPid = lastPid
-                trace("PROCESS_EXIT", "pid=${exitedPid ?: "<unavailable>"} exitCode=$rc stdoutBytes=${if (logFile.exists()) logFile.length() else 0}; shellSignalCandidate=${if (rc in 129..192) rc - 128 else "none"} (heuristic only)")
+                val channels = synchronized(connectedIpc) { connectedIpc.toList().sorted() }
+                val exitStage = if (channels.isEmpty()) "PROCESS_EXIT_BEFORE_IPC" else "PROCESS_EXIT_AFTER_IPC"
+                trace(exitStage, "pid=${exitedPid ?: "<unavailable>"} exitCode=$rc connectedIpc=${channels.ifEmpty { listOf("<none>") }.joinToString()}; stdoutBytes=${if (logFile.exists()) logFile.length() else 0}; shellSignalCandidate=${if (rc in 129..192) rc - 128 else "none"} (heuristic only)", phase = true)
                 logcatExcerpt = exitedPid?.let { collectLogcat(it) } ?: "PID unavailable; could not correlate app-level logcat with the child process."
                 trace("LOGCAT_CAPTURE_COMPLETE", logcatExcerpt)
                 val combined = buildString {
@@ -192,7 +198,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val dump = File(ctx.cacheDir, "ozma-logcat-dump.txt")
         return try {
             dump.delete()
-            val collector = ProcessBuilder("logcat", "-d", "-v", "threadtime", "-t", "500")
+            val collector = ProcessBuilder("logcat", "-b", "all", "-d", "-v", "threadtime", "-t", "1200")
                 .redirectErrorStream(true)
                 .redirectOutput(dump)
                 .start()
@@ -204,7 +210,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             } else {
                 val lines = dump.readLines()
                 val pidHeader = Regex("^\\S+\\s+\\S+\\s+${pid}\\s")
-                val anchors = Regex("(?i)(SIGSYS|seccomp|fatal signal|signal 31|debuggerd|tombstoned|avc: denied|pid:\\s*${pid}\\b)")
+                val anchors = Regex("(?i)(SIGSYS|SIGSEGV|SIGABRT|seccomp|fatal signal|signal 31|debuggerd|tombstoned|avc: denied|CANNOT LINK EXECUTABLE|linker.*(bricktracker|ld-linux)|bricktracker.*(linker|fatal)|pid:\\s*${pid}\\b)")
                 val hits = lines.indices.filter { i ->
                     pidHeader.containsMatchIn(lines[i]) || anchors.containsMatchIn(lines[i])
                 }
@@ -263,7 +269,8 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             trace("IPC_ACCEPT_WAIT", "name=$name")
             try {
                 val socket = s.accept()
-                trace("IPC_CONNECTED", "name=$name")
+                connectedIpc.add(name)
+                trace("IPC_CONNECTED", "name=$name", phase = true)
                 body(socket)
             } catch (t: Throwable) {
                 trace("IPC_ACCEPT_OR_HANDLER_FAILED", "name=$name error=$t")
@@ -364,6 +371,18 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
     }
     private val BuildConfig_VERSION = "1"
 
+    private fun readSmallFile(path: String): String = try {
+        File(path).readText().trim().replace('\n', ' ').take(1200)
+    } catch (t: Throwable) { "<unavailable: ${t.javaClass.simpleName}: ${t.message}>" }
+
+    private fun readProcStatus(): String = try {
+        File("/proc/self/status").readLines()
+            .filter { it.startsWith("Name:") || it.startsWith("Pid:") || it.startsWith("PPid:") ||
+                it.startsWith("Seccomp:") || it.startsWith("Seccomp_filters:") ||
+                it.startsWith("NoNewPrivs:") || it.startsWith("CapEff:") }
+            .joinToString("; ")
+    } catch (t: Throwable) { "<unavailable: ${t.javaClass.simpleName}: ${t.message}>" }
+
     /** Passive diagnostics; does not execute native code or change syscall policy. */
     fun diagnosticReport(exitSummary: String = ""): String {
         fun status(f: File): String = "${f.absolutePath}: exists=${f.exists()}, readable=${f.canRead()}, executable=${f.canExecute()}, size=${if (f.exists()) f.length() else 0}"
@@ -395,6 +414,12 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine("OZMA Android diagnostic report")
             appendLine("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
             appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            appendLine("Android build: ${android.os.Build.DISPLAY} | incremental=${android.os.Build.VERSION.INCREMENTAL} | securityPatch=${android.os.Build.VERSION.SECURITY_PATCH}")
+            appendLine("Build fingerprint: ${android.os.Build.FINGERPRINT}")
+            appendLine("Hardware: board=${android.os.Build.BOARD} device=${android.os.Build.DEVICE} product=${android.os.Build.PRODUCT} hardware=${android.os.Build.HARDWARE}")
+            appendLine("Kernel: ${readSmallFile("/proc/version")}")
+            appendLine("App process security: ${readProcStatus()}")
+            appendLine("Seccomp actions available: ${readSmallFile("/proc/sys/kernel/seccomp/actions_avail")}")
             appendLine("ABIs: ${android.os.Build.SUPPORTED_ABIS.joinToString()}")
             appendLine("Target SDK: 28 | app version: 0.1")
             appendLine("Data directory: ${dataDir.absolutePath}")
@@ -405,7 +430,8 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
             appendLine(status(shim)); appendLine(elf(shim))
             appendLine("Extraction stamp: ${File(home, ".id").let { if (it.exists()) it.readText() else "<missing>" }}")
             appendLine("Input devices:"); appendLine(devices)
-            appendLine("Run state: stage=$currentStage pid=${lastPid ?: "<not started>"} exitCode=${lastExitCode ?: "<running/unknown>"}")
+            appendLine("Run state: phase=$currentStage lastEvent=$lastTraceEvent pid=${lastPid ?: "<not started>"} exitCode=${lastExitCode ?: "<running/unknown>"}")
+            appendLine("Connected IPC channels: ${synchronized(connectedIpc) { connectedIpc.toList().sorted().ifEmpty { listOf("<none>") }.joinToString() }}")
             appendLine("Trace file: ${traceFile.absolutePath}")
             appendLine("Recent execution trace:"); appendLine(tailFile(traceFile, 120))
             appendLine("Exit summary:"); appendLine(exitSummary)
