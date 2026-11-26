@@ -1,0 +1,215 @@
+package com.ozma.android
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
+import android.net.LocalServerSocket
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
+import android.os.Process as AndroidProcess
+import android.view.SurfaceHolder
+import java.io.DataInputStream
+import java.io.File
+import java.io.OutputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+import java.util.zip.ZipInputStream
+
+/**
+ * Runs OZMA's unmodified aarch64-glibc `bricktracker` as a child process through the bundled glibc loader and bridges
+ * its (shimmed) SDL video / audio / input to Android. See shim/sdl_shim.c for the wire format.
+ */
+class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) -> Unit) {
+    companion object {
+        const val MAX_W = 1920; const val MAX_H = 1080; const val HDR = 64
+        // SDL_GameControllerButton / axis ids (what the shim expects)
+        const val BTN_A = 0; const val BTN_B = 1; const val BTN_X = 2; const val BTN_Y = 3
+        const val BTN_BACK = 4; const val BTN_GUIDE = 5; const val BTN_START = 6
+        const val BTN_LSTICK = 7; const val BTN_RSTICK = 8; const val BTN_LSHOULDER = 9; const val BTN_RSHOULDER = 10
+        const val BTN_UP = 11; const val BTN_DOWN = 12; const val BTN_LEFT = 13; const val BTN_RIGHT = 14
+        const val AX_LX = 0; const val AX_LY = 1; const val AX_RX = 2; const val AX_RY = 3; const val AX_LT = 4; const val AX_RT = 5
+    }
+
+    private val home = File(ctx.filesDir, "ozma")
+    private val ipc = File(ctx.filesDir, "ipc")
+    val dataDir: File = (ctx.getExternalFilesDir(null) ?: ctx.filesDir).let { File(it, "OZMA") }
+    val logFile = File(ctx.filesDir, "ozma.log")
+
+    @Volatile private var process: Process? = null
+    @Volatile private var inputOut: OutputStream? = null
+    @Volatile private var surface: SurfaceHolder? = null
+    @Volatile private var stopping = false
+    @Volatile var videoSize = Pair(1024, 768); private set
+    private val servers = mutableListOf<LocalServerSocket>()
+
+    fun attachSurface(h: SurfaceHolder?) { surface = h }
+
+    // ---------------------------------------------------------------- start / stop
+    fun start() {
+        stopping = false
+        Thread({ try { startInternal() } catch (t: Throwable) { onExit(-1, "start failed: $t") } }, "ozma-start").start()
+    }
+
+    private fun startInternal() {
+        extractIfNeeded()
+        ipc.deleteRecursively(); ipc.mkdirs(); dataDir.mkdirs()
+        // shared frames file
+        val shmFile = File(ipc, "frames.shm")
+        val raf = RandomAccessFile(shmFile, "rw"); raf.setLength((HDR + 2L * MAX_W * MAX_H * 4)); 
+        val shm = raf.channel.map(FileChannel.MapMode.READ_WRITE, 0, raf.length()).order(ByteOrder.LITTLE_ENDIAN)
+
+        val vs = server("video.sock"); val asrv = server("audio.sock"); val isrv = server("input.sock")
+
+        val lib = File(home, "lib"); val bin = File(home, "bin/bricktracker")
+        val pb = ProcessBuilder(File(lib, "ld-linux-aarch64.so.1").path, "--library-path", lib.path, bin.path, "--fullscreen")
+        pb.directory(dataDir)
+        val env = pb.environment()
+        env.remove("LD_LIBRARY_PATH"); env.remove("LD_PRELOAD")        // Android's bionic paths must not leak into glibc
+        env["OZMA_IPC"] = ipc.path; env["OZMA_W"] = "1024"; env["OZMA_H"] = "768"
+        env["HOME"] = dataDir.path; env["BT_APP_DIR"] = home.path; env["BT_DATA"] = dataDir.path
+        env["TMPDIR"] = ctx.cacheDir.path
+        // what platform/detect.sh exports for the 'safe' profile (no sysfs, no codec, no USB gadget, ...)
+        mapOf("BT_ALSA_DIRECT" to "0", "BT_STICK_AS_DPAD" to "1", "BT_FN_KEYS" to "0", "BT_DEVICE_WORD" to "CONSOLE",
+            "BT_STUDIO" to "0", "BT_STUDIO_CLOCKS" to "0", "BT_USB_HOSTFIX" to "0", "BT_USB_AVAIL" to "0",
+            "BT_SPEAKER_CTL" to "0", "BT_MIC_MIXER" to "0", "BT_PAUSE_SERVICES" to "", "BT_IDLE_INHIBIT" to "none",
+            "BT_POWER_KEY" to "os", "BT_UPDATE" to "notify", "BT_REPORT" to "0").forEach { (k, v) -> env[k] = v }
+        pb.redirectErrorStream(true); pb.redirectOutput(logFile)
+        val p = pb.start(); process = p
+
+        accept(vs) { videoLoop(it, shm) }
+        accept(asrv) { audioLoop(it) }
+        accept(isrv) { inputOut = it.outputStream }
+
+        Thread({
+            val rc = p.waitFor()
+            if (!stopping) onExit(rc, tailLog())
+        }, "ozma-wait").start()
+    }
+
+    fun stop() {
+        stopping = true
+        send(3, 0, 0)                                  // ask for SDL_QUIT first so OZMA can save
+        val p = process
+        Thread({
+            try {
+                Thread.sleep(1500); p?.destroy()       // SIGTERM (OZMA saves on it)
+                Thread.sleep(1500); p?.destroyForcibly()
+            } catch (_: Throwable) {}
+            servers.forEach { try { it.close() } catch (_: Throwable) {} }
+        }, "ozma-stop").start()
+    }
+
+    fun tailLog(n: Int = 25): String = try { logFile.readLines().takeLast(n).joinToString("\n") } catch (_: Throwable) { "" }
+
+    // ---------------------------------------------------------------- input
+    private val inLock = Any()
+    private fun send(type: Int, code: Int, value: Int) {
+        val o = inputOut ?: return
+        synchronized(inLock) {
+            try { o.write(byteArrayOf(type.toByte(), code.toByte(), (value and 0xff).toByte(), ((value shr 8) and 0xff).toByte(), 0, 0, 0, 0)); o.flush() } catch (_: Throwable) {}
+        }
+    }
+    fun button(code: Int, down: Boolean) = send(1, code, if (down) 1 else 0)
+    fun axis(code: Int, value: Int) = send(2, code, value.coerceIn(-32768, 32767))
+
+    // ---------------------------------------------------------------- ipc helpers
+    private fun server(name: String): LocalServerSocket {
+        val path = File(ipc, name); path.delete()
+        val ls = LocalSocket(); ls.bind(LocalSocketAddress(path.path, LocalSocketAddress.Namespace.FILESYSTEM))
+        val s = LocalServerSocket(ls.fileDescriptor); servers += s; return s
+    }
+    private fun accept(s: LocalServerSocket, body: (LocalSocket) -> Unit) {
+        Thread({ try { body(s.accept()) } catch (_: Throwable) {} }, "ozma-ipc").start()
+    }
+
+    // ---------------------------------------------------------------- video
+    private fun videoLoop(sock: LocalSocket, shm: ByteBuffer) {
+        val inp = sock.inputStream; val paint = Paint().apply { isFilterBitmap = false }
+        var bmp: Bitmap? = null; val buf = ByteArray(64)
+        while (true) {
+            var n = inp.read(buf); if (n <= 0) break
+            val idx = buf[n - 1].toInt() and 1                       // newest frame wins; older signals are dropped
+            while (inp.available() > 0) { n = inp.read(buf); if (n <= 0) break }
+            val w = shm.getInt(0); val h = shm.getInt(4)
+            if (w <= 0 || h <= 0 || w > MAX_W || h > MAX_H) continue
+            if (bmp == null || bmp.width != w || bmp.height != h) { bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888); videoSize = Pair(w, h) }
+            val off = HDR + idx * MAX_W * MAX_H * 4
+            val dup = shm.duplicate().order(ByteOrder.LITTLE_ENDIAN); dup.position(off); dup.limit(off + w * h * 4)
+            bmp.copyPixelsFromBuffer(dup)
+            val holder = surface ?: continue
+            val c: Canvas = holder.lockCanvas() ?: continue
+            try {
+                c.drawColor(0xFF000000.toInt())
+                val cw = c.width; val ch = c.height
+                val scale = minOf(cw / w.toFloat(), ch / h.toFloat())
+                val dw = (w * scale).toInt(); val dh = (h * scale).toInt(); val dx = (cw - dw) / 2; val dy = (ch - dh) / 2
+                c.drawBitmap(bmp, null, Rect(dx, dy, dx + dw, dy + dh), paint)
+            } finally { holder.unlockCanvasAndPost(c) }
+        }
+    }
+
+    // ---------------------------------------------------------------- audio
+    private fun audioLoop(sock: LocalSocket) {
+        AndroidProcess.setThreadPriority(AndroidProcess.THREAD_PRIORITY_URGENT_AUDIO)
+        val inp = DataInputStream(sock.inputStream)
+        val hb = ByteArray(16); inp.readFully(hb)
+        val hh = ByteBuffer.wrap(hb).order(ByteOrder.LITTLE_ENDIAN)
+        val freq = hh.getInt(0); val fmt = hh.getInt(4); val ch = hh.getInt(8); val samples = hh.getInt(12)
+        val isFloat = fmt == 0x8120; val bps = if (isFloat) 4 else 2
+        val chunk = samples * ch * bps
+        val mask = if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val enc = if (isFloat) AudioFormat.ENCODING_PCM_FLOAT else AudioFormat.ENCODING_PCM_16BIT
+        val min = AudioTrack.getMinBufferSize(freq, mask, enc)
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setAudioFormat(AudioFormat.Builder().setEncoding(enc).setSampleRate(freq).setChannelMask(mask).build())
+            .setBufferSizeInBytes(maxOf(min, chunk * 2))
+            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY).build()
+        track.play()
+        val raw = ByteArray(chunk); val fl = FloatArray(samples * ch)
+        try {
+            while (true) {
+                inp.readFully(raw)
+                if (isFloat) { ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(fl); track.write(fl, 0, fl.size, AudioTrack.WRITE_BLOCKING) }
+                else track.write(raw, 0, raw.size)
+            }
+        } finally { try { track.stop(); track.release() } catch (_: Throwable) {} }
+    }
+
+    // ---------------------------------------------------------------- extraction
+    private fun extractIfNeeded() {
+        val id = ctx.assets.open("runtime.id").bufferedReader().readText().trim() + "-" + BuildConfig_VERSION
+        val stamp = File(home, ".id")
+        if (stamp.exists() && stamp.readText() == id && File(home, "bin/bricktracker").exists()) return
+        home.deleteRecursively(); home.mkdirs()
+        ZipInputStream(ctx.assets.open("runtime.zip")).use { z ->
+            while (true) {
+                val e = z.nextEntry ?: break
+                val out = File(home, e.name); if (!out.canonicalPath.startsWith(home.canonicalPath)) continue   // zip-slip guard
+                if (e.isDirectory) { out.mkdirs(); continue }
+                out.parentFile?.mkdirs()
+                if (e.name.startsWith("data/")) continue                  // data goes to the user-visible folder below
+                out.outputStream().use { z.copyTo(it) }
+                if (e.name.startsWith("bin/") || e.name.startsWith("lib/")) out.setExecutable(true, false)
+            }
+        }
+        // stock songs / samples: copy only what is missing (never overwrite the user's files)
+        ZipInputStream(ctx.assets.open("runtime.zip")).use { z ->
+            while (true) {
+                val e = z.nextEntry ?: break
+                if (e.isDirectory || !e.name.startsWith("data/")) continue
+                val out = File(dataDir, e.name.removePrefix("data/")); if (!out.canonicalPath.startsWith(dataDir.canonicalPath)) continue
+                if (!out.exists()) { out.parentFile?.mkdirs(); out.outputStream().use { z.copyTo(it) } }
+            }
+        }
+        stamp.writeText(id)
+    }
+    private val BuildConfig_VERSION = "1"
+}
