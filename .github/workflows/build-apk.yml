@@ -22,7 +22,7 @@ jobs:
           mkdir -p build/libs
           docker run --rm -v "$PWD":/w debian:bullseye bash -euxc '
             apt-get update
-            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             aarch64-linux-gnu-gcc -shared -fPIC -O2 -fvisibility=hidden -Wl,-soname,libSDL2-2.0.so.0 \
               -o /w/build/libs/libSDL2-2.0.so.0 /w/shim/sdl_shim.c -lpthread
             for f in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2; do
