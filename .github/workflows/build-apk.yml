@@ -15,12 +15,12 @@ jobs:
           [ -n "$ZIP" ] || { echo "::error::Put OZMA-0_9_5-ports.zip inside the ozma/ folder of the repo"; exit 1; }
           echo "OZMA_ZIP=$ZIP" >> "$GITHUB_ENV"
 
-      # Debian bullseye = glibc 2.31 (before clone3): safest for Android 12's seccomp filter.
+      # Debian bookworm = glibc 2.36. glibc < 2.33 calls the legacy getrlimit syscall in libpthread's init, which Android 12 traps (SIGSYS).
       # Only compiles the shim and copies the glibc files; zip/unzip are not needed in here.
-      - name: Build aarch64 shim + glibc in Debian bullseye
+      - name: Build aarch64 shim + glibc in Debian bookworm
         run: |
           mkdir -p build/libs build/probes
-          docker run --rm -v "$PWD":/w debian:bullseye bash -euxc '
+          docker run --rm -v "$PWD":/w debian:bookworm bash -euxc '
             apt-get update
             apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             aarch64-linux-gnu-gcc -shared -fPIC -O2 -fvisibility=hidden -Wl,-soname,libSDL2-2.0.so.0 \
