@@ -3,7 +3,7 @@
 # Output: app/src/main/assets/runtime.zip + runtime.id, app/src/main/res/drawable-nodpi/ic_launcher.png
 #
 # aarch64 pieces (our libSDL2 shim + glibc loader/libs) come from either:
-#   PREBUILT_LIBS=<dir>   a directory already containing them (used by the GitHub workflow, built in Debian bullseye), or
+#   PREBUILT_LIBS=<dir>   a directory already containing them (used by the GitHub workflow, built in Debian bookworm), or
 #   a local cross toolchain:  sudo apt install gcc-aarch64-linux-gnu zip unzip   (SYSROOT defaults to /usr/aarch64-linux-gnu)
 set -euo pipefail
 ZIP="${1:?usage: $0 OZMA-0_9_5-ports.zip}"

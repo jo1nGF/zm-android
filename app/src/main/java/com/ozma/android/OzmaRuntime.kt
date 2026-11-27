@@ -157,6 +157,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         pb.directory(dataDir)
         val env = pb.environment()
         env.remove("LD_LIBRARY_PATH"); env.remove("LD_PRELOAD")        // Android's bionic paths must not leak into glibc
+        env["GLIBC_TUNABLES"] = "glibc.pthread.rseq=0"                  // Android 12's seccomp filter traps the rseq syscall
         env["OZMA_IPC"] = ipc.path; env["OZMA_W"] = "1024"; env["OZMA_H"] = "768"
         env["HOME"] = dataDir.path; env["BT_APP_DIR"] = home.path; env["BT_DATA"] = dataDir.path
         env["TMPDIR"] = ctx.cacheDir.path
@@ -226,6 +227,7 @@ class OzmaRuntime(private val ctx: Context, private val onExit: (Int, String) ->
         val env = pb.environment()
         env.remove("LD_LIBRARY_PATH")
         env.remove("LD_PRELOAD")
+        env["GLIBC_TUNABLES"] = "glibc.pthread.rseq=0"
         env["LD_DEBUG"] = "libs,versions"
         env["LD_DEBUG_OUTPUT"] = debugPrefix.absolutePath
         pb.redirectErrorStream(true)
