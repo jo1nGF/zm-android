@@ -27,7 +27,8 @@ Se ficar vermelha, abra o passo que falhou e me mande o texto do erro.
 
 ## Pontos de atenção (nada disso foi testado em aparelho)
 - **targetSdk 28 de propósito**: no Android 10+ não dá para executar binários da pasta de dados com targetSdk ≥ 29. Só sideload.
-- O runtime glibc vem do Debian bullseye (2.31, anterior ao `clone3`) para evitar problemas com o seccomp do Android 12.
+- O runtime glibc vem do Debian bookworm (2.36): o glibc < 2.33 usa a syscall `getrlimit`, que o seccomp do Android 12 bloqueia. `GLIBC_TUNABLES=glibc.pthread.rseq=0` desliga a syscall `rseq`, também bloqueada.
+- `tools/ozma_trace.c` (compilado com o NDK no workflow): o seccomp do Android 12 mata (SIGSYS) o processo glibc em syscalls que o bionic não usa. O `ozma-trace` roda o programa sob ptrace só para receber esse sinal e devolver ENOSYS (sem custo nas syscalls permitidas); cada syscall bloqueada aparece no log como `[trace] seccomp blocked syscall N`.
 - Entrada: o shim manda eventos de **game controller**. Se o OZMA não reagir, exporte `OZMA_SHIM_JOYEVENTS=1`
   (em `OzmaRuntime.kt`, no bloco `env[...]`) para mandar também eventos de joystick.
 - O shim implementa só o necessário: `SDL_RenderCopy` ignora flip/rotação/alpha; áudio só S16/F32, saída (sem microfone);

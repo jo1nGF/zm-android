@@ -23,6 +23,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <errno.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
 
 #define EXPORT __attribute__((visibility("default")))
 #define LOG(...) do { fprintf(stderr, "[shim] " __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -38,6 +41,40 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef int16_t 
 #define PF_RGB565   PF(5,1,5,16,2)
 
 static int bytes_pp(u32 f) { return f & 0xff; }
+
+
+/* ---------- SIGSYS safety net ----------
+ * Android's app seccomp filter traps (SIGSYS) syscalls bionic never uses. Newer glibc probes for a few of them and
+ * expects ENOSYS, so we answer ENOSYS ourselves, emulate the legacy rlimit calls, and log every syscall number we see
+ * (look for "[shim] SIGSYS" lines in ozma.log). aarch64 only. */
+#if defined(__aarch64__)
+static volatile int sys_logged;
+static void logsys(long nr, const char *what) {
+    if (sys_logged++ > 60) return;
+    char b[96]; int n = 0; const char *p = "[shim] SIGSYS syscall=";
+    while (*p) b[n++] = *p++;
+    char d[24]; int k = 0; long v = nr < 0 ? 0 : nr; do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (k) b[n++] = d[--k];
+    b[n++] = ' '; while (*what && n < 90) b[n++] = *what++;
+    b[n++] = '\n'; ssize_t w = write(2, b, (size_t)n); (void)w;
+}
+static void sigsys_handler(int sig, siginfo_t *si, void *vctx) {
+    (void)sig; ucontext_t *uc = (ucontext_t *)vctx; int saved = errno;
+    long nr = (long)si->si_syscall, a0 = (long)uc->uc_mcontext.regs[0], a1 = (long)uc->uc_mcontext.regs[1];
+    long ret = -ENOSYS; const char *what = "-> ENOSYS";
+    if (nr == 163) { long r = syscall(261, 0L, a0, 0L, a1); ret = r < 0 ? -errno : r; what = "getrlimit emulated"; }
+    else if (nr == 164) { long r = syscall(261, 0L, a0, a1, 0L); ret = r < 0 ? -errno : r; what = "setrlimit emulated"; }
+    else if (nr == 293) what = "rseq -> ENOSYS";
+    else if (nr == 435) what = "clone3 -> ENOSYS";
+    else if (nr == 439) what = "faccessat2 -> ENOSYS";
+    logsys(nr, what);
+    uc->uc_mcontext.regs[0] = (unsigned long long)ret; errno = saved;
+}
+__attribute__((constructor)) static void sigsys_init(void) {
+    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = sigsys_handler; sa.sa_flags = SA_SIGINFO | SA_NODEFER; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSYS, &sa, 0);
+}
+#endif
 
 /* ---------- ipc ---------- */
 #define MAX_W 1920

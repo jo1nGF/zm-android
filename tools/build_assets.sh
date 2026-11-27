@@ -3,7 +3,7 @@
 # Output: app/src/main/assets/runtime.zip + runtime.id, app/src/main/res/drawable-nodpi/ic_launcher.png
 #
 # aarch64 pieces (our libSDL2 shim + glibc loader/libs) come from either:
-#   PREBUILT_LIBS=<dir>   a directory already containing them (used by the GitHub workflow, built in Debian bullseye), or
+#   PREBUILT_LIBS=<dir>   a directory already containing them (used by the GitHub workflow, built in Debian bookworm), or
 #   a local cross toolchain:  sudo apt install gcc-aarch64-linux-gnu zip unzip   (SYSROOT defaults to /usr/aarch64-linux-gnu)
 set -euo pipefail
 ZIP="${1:?usage: $0 OZMA-0_9_5-ports.zip}"
@@ -36,6 +36,16 @@ for f in libSDL2-2.0.so.0 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.s
   [ -s "$R/lib/$f" ] || { echo "missing $f in runtime lib dir"; exit 1; }
 done
 [ -n "${DATA:-}" ] && cp -r "$DATA"/. "$R/data/"
+
+# Optional prebuilt ARM64 probes used to isolate loader/libpthread/SDL startup.
+if [ -n "${PREBUILT_PROBES:-}" ]; then
+  mkdir -p "$R/diagnostics"
+  for f in glibc-basic glibc-pthread-link-only glibc-pthread glibc-sdl-dlopen; do
+    [ -s "$PREBUILT_PROBES/$f" ] || { echo "missing diagnostic probe: $PREBUILT_PROBES/$f"; exit 1; }
+    cp "$PREBUILT_PROBES/$f" "$R/diagnostics/$f"
+    chmod 755 "$R/diagnostics/$f"
+  done
+fi
 
 mkdir -p "$ROOT/app/src/main/assets" "$ROOT/app/src/main/res/drawable-nodpi"
 rm -f "$ROOT/app/src/main/assets/runtime.zip"
